@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Qt6 6.2 COMPONENTS Core Network)
+include("${CMAKE_CURRENT_LIST_DIR}/ScpiTargets.cmake")
+
+check_required_components(Scpi)
