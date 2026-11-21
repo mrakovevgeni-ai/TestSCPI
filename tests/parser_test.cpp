@@ -20,6 +20,9 @@ private slots:
     void fragmented();
     void invalidFrame_data();
     void invalidFrame();
+    void multipleMessages_data();
+    void multipleMessages();
+    void combinedLimitAndExtraData();
 };
 
 void ParserTest::fragmented_data()
@@ -111,6 +114,59 @@ void ParserTest::invalidFrame()
     QCOMPARE(result.status, ParseStatus::Error);
     QCOMPARE(result.error, error);
     QVERIFY(!result.detail.isEmpty());
+}
+
+void ParserTest::multipleMessages_data()
+{
+    QTest::addColumn<Format>("format");
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<QByteArray>("payload");
+
+    QTest::newRow("text") << Format::Text << QByteArray("first\r\nsecond\n\r\n")
+        << QByteArray("first\nsecond\n");
+    const auto a = QByteArray::fromHex("000a");
+    const auto b = QByteArray::fromHex("230d");
+    QTest::newRow("blocks-lf") << Format::IeeeBlockLf << ("#12" + a + "\n#10\n#12" + b + '\n') << (a + b);
+    QTest::newRow("blocks-crlf") << Format::IeeeBlockCrlf
+        << ("#12" + a + "\r\n#10\r\n#12" + b + "\r\n") << (a + b);
+    QTest::newRow("blocks-no-terminator") << Format::IeeeBlockNoTerminator
+        << ("#12" + a + "#10#12" + b) << (a + b);
+}
+
+void ParserTest::multipleMessages()
+{
+    QFETCH(Format, format);
+    QFETCH(QByteArray, wire);
+    QFETCH(QByteArray, payload);
+
+    for (qsizetype split = 0; split < wire.size(); ++split) {
+        ResponseParser parser(format, payload.size(), 3);
+        QCOMPARE(parser.append(wire.first(split)).status, ParseStatus::NeedMore);
+        const auto result = parser.append(wire.sliced(split));
+        QCOMPARE(result.status, ParseStatus::Complete);
+        QCOMPARE(result.payload, payload);
+    }
+
+    ResponseParser parser(format, payload.size(), 3);
+    for (qsizetype i = 0; i < wire.size() - 1; ++i)
+        QCOMPARE(parser.append(wire.sliced(i, 1)).status, ParseStatus::NeedMore);
+    const auto result = parser.append(wire.last(1));
+    QCOMPARE(result.status, ParseStatus::Complete);
+    QCOMPARE(result.payload, payload);
+}
+
+void ParserTest::combinedLimitAndExtraData()
+{
+    ResponseParser text(Format::Text, 6, 2);
+    QCOMPARE(text.append("abc\n").status, ParseStatus::NeedMore);
+    QCOMPARE(text.append("def\n").error, Error::ResponseTooLarge);
+
+    ResponseParser binary(Format::IeeeBlockNoTerminator, 5, 2);
+    QCOMPARE(binary.append("#13abc#").status, ParseStatus::NeedMore);
+    QCOMPARE(binary.append("13").error, Error::ResponseTooLarge);
+
+    ResponseParser extra(Format::Text, 16, 2);
+    QCOMPARE(extra.append("one\ntwo\nextra\n").error, Error::UnexpectedData);
 }
 
 QTEST_GUILESS_MAIN(ParserTest)

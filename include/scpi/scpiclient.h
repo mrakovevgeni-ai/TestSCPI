@@ -11,6 +11,10 @@
 
 namespace scpi {
 
+namespace detail {
+class ScpiSession;
+}
+
 class SCPI_EXPORT ScpiClient final : public QObject
 {
     Q_OBJECT
@@ -21,7 +25,7 @@ public:
     static constexpr quint16 DefaultPort = 5025;
     static constexpr qsizetype DefaultMaximumResponseSize = 16 * 1024 * 1024;
 
-    enum class SessionState { Closed, Connecting, Connected };
+    enum class SessionState { Closed, Connecting, Connected, Reconnecting };
     Q_ENUM(SessionState)
 
     enum class Availability { Unknown, Available, Unavailable };
@@ -48,7 +52,8 @@ public:
         UnexpectedData,
         UnexpectedResponse,
         SessionLost,
-        Cancelled
+        Cancelled,
+        InvalidMessageCount
     };
     Q_ENUM(Error)
 
@@ -56,6 +61,13 @@ public:
         int connectMs = 3000;
         int responseMs = 3000;
         int availabilityMs = 1000;
+    };
+
+    struct RecoveryPolicy {
+        bool enabled = true;
+        int maxAttempts = 5;
+        int initialDelayMs = 250;
+        int maxDelayMs = 4000;
     };
 
     explicit ScpiClient(QObject *parent = nullptr);
@@ -69,6 +81,8 @@ public:
     Timeouts timeouts() const;
     bool setMaximumResponseSize(qsizetype bytes);
     qsizetype maximumResponseSize() const;
+    bool setRecoveryPolicy(RecoveryPolicy policy);
+    RecoveryPolicy recoveryPolicy() const;
 
     bool setAvailabilityCommand(QByteArray command);
     QByteArray availabilityCommand() const;
@@ -80,8 +94,12 @@ public:
     OperationId open();
     OperationId close();
     OperationId send(QByteArray command);
+    // A confirmed send waits for the reply to *OPC? in the same queued operation.
+    OperationId send(QByteArray command, bool confirm);
     OperationId sendConfirmed(QByteArray command);
     OperationId query(QByteArray command, ResponseFormat format = ResponseFormat::Text);
+    // Deliver the payload of all expected messages in one operationFinished signal.
+    OperationId query(QByteArray command, ResponseFormat format, qsizetype messageCount);
     OperationId checkAvailability();
 
     bool startMonitoring(int intervalMs);
@@ -97,8 +115,7 @@ signals:
                                    const QString &detail);
 
 private:
-    struct Private;
-    std::unique_ptr<Private> d;
+    std::unique_ptr<detail::ScpiSession> d;
 };
 
 } // namespace scpi

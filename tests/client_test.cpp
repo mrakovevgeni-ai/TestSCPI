@@ -1,88 +1,6 @@
-#include <scpi/scpiclient.h>
+#include "testsupport.h"
 
-#include <QTcpServer>
-#include <QTcpSocket>
-#include <QtTest>
-
-using scpi::ScpiClient;
-using Error = ScpiClient::Error;
-using State = ScpiClient::SessionState;
-using Availability = ScpiClient::Availability;
-using Format = ScpiClient::ResponseFormat;
-using OperationId = ScpiClient::OperationId;
-
-namespace {
-
-class Instrument : public QObject
-{
-public:
-    Instrument()
-    {
-        connect(&server, &QTcpServer::newConnection, this, [this] {
-            while (auto *peer = server.nextPendingConnection()) {
-                const auto index = peers.size();
-                peers.append(peer);
-                peer->setSocketOption(QAbstractSocket::LowDelayOption, 1);
-                connect(peer, &QTcpSocket::readyRead, this, [this, peer, index] {
-                    while (peer->canReadLine()) {
-                        auto line = peer->readLine();
-                        line.chop(1);
-                        commands.append(line);
-                        commandConnections.append(index);
-                    }
-                });
-                connect(peer, &QTcpSocket::disconnected, this, [this] { ++disconnections; });
-            }
-        });
-    }
-
-    bool listen()
-    {
-        return server.listen(QHostAddress::LocalHost);
-    }
-
-    quint16 port() const
-    {
-        return server.serverPort();
-    }
-
-    void write(qsizetype index, const QByteArray &bytes)
-    {
-        QCOMPARE(peers.at(index)->write(bytes), bytes.size());
-    }
-
-    QList<QTcpSocket *> peers;
-    QList<QByteArray> commands;
-    QList<qsizetype> commandConnections;
-    int disconnections = 0;
-    QTcpServer server;
-};
-
-void expectSuccess(const QSignalSpy &spy, qsizetype row, OperationId id, const QByteArray &payload = {})
-{
-    QVERIFY(row < spy.size());
-    QCOMPARE(spy.at(row).at(0).toULongLong(), id);
-    QCOMPARE(spy.at(row).at(1).toByteArray(), payload);
-}
-
-void expectFailure(const QSignalSpy &spy, qsizetype row, OperationId id, Error error)
-{
-    QVERIFY(row < spy.size());
-    QCOMPARE(spy.at(row).at(0).toULongLong(), id);
-    QCOMPARE(spy.at(row).at(1).value<Error>(), error);
-    QVERIFY(!spy.at(row).at(2).toString().isEmpty());
-}
-
-void expectCheck(const QSignalSpy &spy, qsizetype row, OperationId id, Error error = Error::None)
-{
-    QVERIFY(row < spy.size());
-    QCOMPARE(spy.at(row).at(0).toULongLong(), id);
-    QCOMPARE(spy.at(row).at(1).toBool(), error == Error::None);
-    QCOMPARE(spy.at(row).at(2).value<Error>(), error);
-    QCOMPARE(spy.at(row).at(3).toString().isEmpty(), error == Error::None);
-}
-
-} // namespace
+using namespace scpi::test;
 
 class ClientTest : public QObject
 {
@@ -104,6 +22,7 @@ private slots:
     void offlineCheckTimeout();
     void invalidRequestsAndCloseCancellation();
     void connectionRefused();
+    void multiMessageReplyKeepsQueue();
 };
 
 void ClientTest::fifoAndFragmentedReplies()
@@ -118,7 +37,7 @@ void ClientTest::fifoAndFragmentedReplies()
     QSignalSpy states(&client, &ScpiClient::sessionStateChanged);
 
     const auto open = client.open();
-    const auto set = client.send("VOLT 3\r\n");
+    const auto set = client.send("VOLT 3\r\n", false);
     const auto text = client.query("MEAS?");
     const auto block = client.query("TRACE?", Format::IeeeBlockCrlf);
     const auto last = client.query("AFTER?");
@@ -192,7 +111,7 @@ void ClientTest::confirmedKeepsQueue()
     QSignalSpy failed(&client, &ScpiClient::operationFailed);
 
     const auto open = client.open();
-    const auto set = client.sendConfirmed("VOLT 5");
+    const auto set = client.send("VOLT 5", true);
     const auto query = client.query("VOLT?");
     QTRY_COMPARE(instrument.commands, (QList<QByteArray>{"VOLT 5", "*OPC?"}));
     QCOMPARE(instrument.commandConnections, (QList<qsizetype>{0, 0}));
@@ -229,6 +148,7 @@ void ClientTest::timeoutClosesSession()
     Instrument instrument;
     QVERIFY(instrument.listen());
     ScpiClient client;
+    QVERIFY(client.setRecoveryPolicy({false}));
     QVERIFY(client.setEndpoint(QHostAddress::LocalHost, instrument.port()));
     constexpr int replyTimeoutMs = 300;
     QVERIFY(client.setTimeouts({1000, replyTimeoutMs, 500}));
@@ -280,6 +200,7 @@ void ClientTest::remoteDisconnectCompletesOnce()
     Instrument instrument;
     QVERIFY(instrument.listen());
     ScpiClient client;
+    QVERIFY(client.setRecoveryPolicy({false}));
     QVERIFY(client.setEndpoint(QHostAddress::LocalHost, instrument.port()));
     QSignalSpy done(&client, &ScpiClient::operationFinished);
     QSignalSpy failed(&client, &ScpiClient::operationFailed);
@@ -311,6 +232,7 @@ void ClientTest::completeReplyBeforeDisconnect()
     Instrument instrument;
     QVERIFY(instrument.listen());
     ScpiClient client;
+    QVERIFY(client.setRecoveryPolicy({false}));
     QVERIFY(client.setEndpoint(QHostAddress::LocalHost, instrument.port()));
     QSignalSpy done(&client, &ScpiClient::operationFinished);
     QSignalSpy failed(&client, &ScpiClient::operationFailed);
@@ -344,6 +266,7 @@ void ClientTest::invalidBlockClosesSession()
     Instrument instrument;
     QVERIFY(instrument.listen());
     ScpiClient client;
+    QVERIFY(client.setRecoveryPolicy({false}));
     QVERIFY(client.setEndpoint(QHostAddress::LocalHost, instrument.port()));
     QVERIFY(client.setMaximumResponseSize(4));
     QSignalSpy done(&client, &ScpiClient::operationFinished);
@@ -601,6 +524,7 @@ void ClientTest::connectionRefused()
     instrument.server.close();
 
     ScpiClient client;
+    QVERIFY(client.setRecoveryPolicy({false}));
     QVERIFY(client.setEndpoint(QHostAddress::LocalHost, port));
     QSignalSpy done(&client, &ScpiClient::operationFinished);
     QSignalSpy failed(&client, &ScpiClient::operationFailed);
@@ -616,6 +540,41 @@ void ClientTest::connectionRefused()
     QTRY_COMPARE(states.size(), 2);
     QCOMPARE(states.at(0).at(0).value<State>(), State::Connecting);
     QCOMPARE(states.at(1).at(0).value<State>(), State::Closed);
+}
+
+void ClientTest::multiMessageReplyKeepsQueue()
+{
+    Instrument instrument;
+    QVERIFY(instrument.listen());
+    ScpiClient client;
+    QVERIFY(client.setEndpoint(QHostAddress::LocalHost, instrument.port()));
+    QSignalSpy done(&client, &ScpiClient::operationFinished);
+    QSignalSpy failed(&client, &ScpiClient::operationFailed);
+
+    const auto open = client.open();
+    const auto invalid = client.query("MULTI?", Format::Text, 0);
+    const auto multiple = client.query("MULTI?", Format::Text, 3);
+    const auto next = client.query("NEXT?");
+    QTRY_COMPARE(instrument.commands, QList<QByteArray>{"MULTI?"});
+    QTRY_COMPARE(failed.size(), 1);
+    expectFailure(failed, 0, invalid, Error::InvalidMessageCount);
+    QTRY_COMPARE(done.size(), 1);
+    expectSuccess(done, 0, open);
+
+    instrument.write(0, "first\r\nsec");
+    QTest::qWait(25);
+    instrument.write(0, "ond\nthird\r");
+    QTest::qWait(25);
+    QCOMPARE(done.size(), 1);
+    QCOMPARE(instrument.commands.size(), 1);
+    instrument.write(0, "\n");
+    QTRY_COMPARE(done.size(), 2);
+    expectSuccess(done, 1, multiple, "first\nsecond\nthird");
+    QTRY_COMPARE(instrument.commands, (QList<QByteArray>{"MULTI?", "NEXT?"}));
+    instrument.write(0, "next\n");
+    QTRY_COMPARE(done.size(), 3);
+    expectSuccess(done, 2, next, "next");
+    QCOMPARE(failed.size(), 1);
 }
 
 QTEST_GUILESS_MAIN(ClientTest)

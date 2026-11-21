@@ -1,7 +1,5 @@
 #include "responseparser.h"
 
-#include <QByteArrayView>
-
 #include <algorithm>
 #include <utility>
 
@@ -11,106 +9,121 @@ namespace {
 using Error = ScpiClient::Error;
 using Format = ScpiClient::ResponseFormat;
 
-ParseResult parseFailure(Error error, const QString &detail)
+QByteArrayView blockTerminator(Format format)
 {
-    return {ParseStatus::Error, {}, error, detail};
-}
-
-ParseResult complete(QByteArray payload)
-{
-    return {ParseStatus::Complete, std::move(payload), Error::None, {}};
+    if (format == Format::IeeeBlockLf)
+        return "\n";
+    if (format == Format::IeeeBlockCrlf)
+        return "\r\n";
+    return {};
 }
 
 } // namespace
 
-ResponseParser::ResponseParser(Format format, qsizetype maxPayloadSize)
-    : m_format(format), m_maxPayloadSize(maxPayloadSize)
+ResponseParser::ResponseParser(Format format, qsizetype maxPayloadSize, qsizetype messageCount)
+    : m_format(format), m_maxPayloadSize(maxPayloadSize), m_messageCount(messageCount)
 {
 }
 
 ParseResult ResponseParser::append(const QByteArray &bytes)
 {
     m_buffer.append(bytes);
-    if (m_format == Format::Text)
-        return parseText();
-    return parseBlock();
-}
+    qsizetype consumed = 0;
+    while (consumed < m_buffer.size()) {
+        const bool text = m_format == Format::Text;
+        const bool separator = text && m_received > 0;
+        const qsizetype budget = m_maxPayloadSize - m_payload.size() - separator;
+        const auto input = QByteArrayView(m_buffer).sliced(consumed);
+        const auto frame = text ? parseText(input, budget) : parseBlock(input, budget);
 
-ParseResult ResponseParser::parseText()
-{
-    const qsizetype lf = m_buffer.indexOf('\n', m_textScanOffset);
-    if (lf >= 0) {
-        const bool hasCr = lf > 0 && m_buffer.at(lf - 1) == '\r';
-        const qsizetype payloadSize = lf - hasCr;
-        if (payloadSize > m_maxPayloadSize)
-            return parseFailure(Error::ResponseTooLarge, QStringLiteral("Text response exceeds the size limit."));
-        if (lf + 1 != m_buffer.size())
-            return parseFailure(Error::UnexpectedData, QStringLiteral("Extra bytes after the text response."));
-        m_buffer.truncate(payloadSize);
-        return complete(std::move(m_buffer));
+        if (frame.status == ParseStatus::Error)
+            return {ParseStatus::Error, {}, frame.error, frame.detail};
+        if (frame.status == ParseStatus::NeedMore)
+            break;
+
+        if (separator)
+            m_payload.append('\n');
+        m_payload.append(input.data() + frame.payloadOffset, frame.payloadSize);
+        consumed += frame.wireSize;
+        m_textScanOffset = 0;
+
+        if (++m_received == m_messageCount) {
+            if (consumed != m_buffer.size()) {
+                return {ParseStatus::Error, {}, Error::UnexpectedData,
+                        QStringLiteral("Extra bytes after the final SCPI message.")};
+            }
+            return {ParseStatus::Complete, std::move(m_payload), Error::None, {}};
+        }
     }
 
-    m_textScanOffset = m_buffer.size();
-    const qsizetype possiblePayloadSize = m_buffer.size() - m_buffer.endsWith('\r');
-    if (possiblePayloadSize > m_maxPayloadSize)
-        return parseFailure(Error::ResponseTooLarge, QStringLiteral("Text response exceeds the size limit."));
+    // Keep only the incomplete frame. Its text search offset stays relative to its start.
+    if (consumed > 0)
+        m_buffer.remove(0, consumed);
     return {};
 }
 
-ParseResult ResponseParser::parseBlock()
+ResponseParser::Frame ResponseParser::Frame::failure(Error error, const QString &detail)
 {
-    if (m_headerSize == 0) {
-        if (!m_buffer.isEmpty() && m_buffer.at(0) != '#')
-            return parseFailure(Error::MalformedResponse, QStringLiteral("Expected an IEEE 488.2 block header."));
-        if (m_buffer.size() < 2)
-            return {};
+    return {ParseStatus::Error, 0, 0, 0, error, detail};
+}
 
-        const char digits = m_buffer.at(1);
-        if (digits == '0')
-            return parseFailure(Error::UnsupportedFormat, QStringLiteral("Indefinite IEEE 488.2 blocks are unsupported."));
-        if (digits < '1' || digits > '9')
-            return parseFailure(Error::MalformedResponse, QStringLiteral("Invalid IEEE 488.2 length field width."));
-
-        const qsizetype headerSize = 2 + (digits - '0');
-        qsizetype payloadSize = 0;
-        for (qsizetype i = 2; i < std::min(headerSize, m_buffer.size()); ++i) {
-            const char digit = m_buffer.at(i);
-            if (digit < '0' || digit > '9')
-                return parseFailure(Error::MalformedResponse, QStringLiteral("Invalid digit in the IEEE 488.2 length."));
-            payloadSize = payloadSize * 10 + (digit - '0');
-        }
-        if (m_buffer.size() < headerSize)
-            return {};
-        if (payloadSize > m_maxPayloadSize)
-            return parseFailure(Error::ResponseTooLarge, QStringLiteral("Binary response exceeds the size limit."));
-
-        m_headerSize = headerSize;
-        m_payloadSize = payloadSize;
+ResponseParser::Frame ResponseParser::parseText(QByteArrayView input, qsizetype budget)
+{
+    const qsizetype lf = input.indexOf('\n', m_textScanOffset);
+    if (lf >= 0) {
+        const bool hasCr = lf > 0 && input.at(lf - 1) == '\r';
+        const qsizetype payloadSize = lf - hasCr;
+        if (payloadSize > budget)
+            return Frame::failure(Error::ResponseTooLarge, QStringLiteral("Text response exceeds the size limit."));
+        return {ParseStatus::Complete, 0, payloadSize, lf + 1, Error::None, {}};
     }
 
-    const qsizetype payloadEnd = m_headerSize + m_payloadSize;
-    if (m_buffer.size() < payloadEnd)
+    m_textScanOffset = input.size();
+    const qsizetype possiblePayloadSize = input.size() - (input.back() == '\r');
+    if (possiblePayloadSize > budget)
+        return Frame::failure(Error::ResponseTooLarge, QStringLiteral("Text response exceeds the size limit."));
+    return {};
+}
+
+ResponseParser::Frame ResponseParser::parseBlock(QByteArrayView input, qsizetype budget) const
+{
+    if (input.front() != '#')
+        return Frame::failure(Error::MalformedResponse, QStringLiteral("Expected an IEEE 488.2 block header."));
+    if (input.size() < 2)
         return {};
 
-    QByteArrayView terminator;
-    if (m_format == Format::IeeeBlockLf)
-        terminator = "\n";
-    else if (m_format == Format::IeeeBlockCrlf)
-        terminator = "\r\n";
+    const char digits = input.at(1);
+    if (digits == '0')
+        return Frame::failure(Error::UnsupportedFormat, QStringLiteral("Indefinite IEEE 488.2 blocks are unsupported."));
+    if (digits < '1' || digits > '9')
+        return Frame::failure(Error::MalformedResponse, QStringLiteral("Invalid IEEE 488.2 length field width."));
 
-    const qsizetype suffixSize = m_buffer.size() - payloadEnd;
+    const qsizetype headerSize = 2 + (digits - '0');
+    qsizetype payloadSize = 0;
+    for (qsizetype i = 2; i < std::min(headerSize, input.size()); ++i) {
+        const char digit = input.at(i);
+        if (digit < '0' || digit > '9')
+            return Frame::failure(Error::MalformedResponse, QStringLiteral("Invalid digit in the IEEE 488.2 length."));
+        payloadSize = payloadSize * 10 + (digit - '0');
+    }
+    if (input.size() < headerSize)
+        return {};
+    if (payloadSize > budget)
+        return Frame::failure(Error::ResponseTooLarge, QStringLiteral("Binary response exceeds the size limit."));
+
+    const qsizetype payloadEnd = headerSize + payloadSize;
+    if (input.size() < payloadEnd)
+        return {};
+
+    const auto terminator = blockTerminator(m_format);
+    const qsizetype suffixSize = input.size() - payloadEnd;
     for (qsizetype i = 0; i < std::min(suffixSize, terminator.size()); ++i) {
-        if (m_buffer.at(payloadEnd + i) != terminator.at(i))
-            return parseFailure(Error::MalformedResponse, QStringLiteral("Invalid IEEE 488.2 block terminator."));
+        if (input.at(payloadEnd + i) != terminator.at(i))
+            return Frame::failure(Error::MalformedResponse, QStringLiteral("Invalid IEEE 488.2 block terminator."));
     }
     if (suffixSize < terminator.size())
         return {};
-    if (suffixSize > terminator.size())
-        return parseFailure(Error::UnexpectedData, QStringLiteral("Extra bytes after the IEEE 488.2 block."));
-
-    m_buffer.truncate(payloadEnd);
-    m_buffer.remove(0, m_headerSize);
-    return complete(std::move(m_buffer));
+    return {ParseStatus::Complete, headerSize, payloadSize, payloadEnd + terminator.size(), Error::None, {}};
 }
 
 } // namespace scpi::detail

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(Scpi VERSION 1.0.0 LANGUAGES CXX)
+project(Scpi VERSION 1.1.0 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
@@ -13,6 +13,13 @@ add_library(scpi SHARED
     src/scpiclient.cpp
     src/responseparser.h
     src/responseparser.cpp
+    src/reconnectbackoff.h
+    src/scpioperation.h
+    src/scpioperation.cpp
+    src/scpisession.h
+    src/scpisession.cpp
+    src/tcptransport.h
+    src/tcptransport.cpp
 )
 add_library(Scpi::scpi ALIAS scpi)
 set_target_properties(scpi PROPERTIES
@@ -38,17 +45,36 @@ if(SCPI_BUILD_EXAMPLE)
     target_link_libraries(scpi_example PRIVATE Scpi::scpi)
 endif()
 
+option(SCPI_BUILD_EMULATOR "Build the TCP instrument emulator" ON)
+if(SCPI_BUILD_EMULATOR OR BUILD_TESTING)
+    add_library(scpi_emulator_support STATIC
+        emulator/instrumentemulator.cpp
+        emulator/instrumentemulator.h
+    )
+    target_compile_features(scpi_emulator_support PUBLIC cxx_std_17)
+    target_include_directories(scpi_emulator_support PUBLIC emulator)
+    target_link_libraries(scpi_emulator_support PUBLIC Qt6::Core Qt6::Network)
+endif()
+
+if(SCPI_BUILD_EMULATOR)
+    add_executable(scpi_emulator emulator/main.cpp)
+    target_link_libraries(scpi_emulator PRIVATE scpi_emulator_support)
+    install(TARGETS scpi_emulator RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
+
 if(BUILD_TESTING)
     find_package(Qt6 6.2 REQUIRED COMPONENTS Test)
 
     add_executable(scpi_parser_tests tests/parser_test.cpp src/responseparser.cpp)
     target_include_directories(scpi_parser_tests PRIVATE src)
-    target_link_libraries(scpi_parser_tests PRIVATE Scpi::scpi Qt6::Test)
 
     add_executable(scpi_client_tests tests/client_test.cpp)
-    target_link_libraries(scpi_client_tests PRIVATE Scpi::scpi Qt6::Test)
+    add_executable(scpi_recovery_tests tests/recovery_test.cpp)
+    add_executable(scpi_emulator_tests tests/emulator_test.cpp)
+    target_link_libraries(scpi_emulator_tests PRIVATE scpi_emulator_support)
 
-    foreach(test_target IN ITEMS scpi_parser_tests scpi_client_tests)
+    foreach(test_target IN ITEMS scpi_parser_tests scpi_client_tests scpi_recovery_tests scpi_emulator_tests)
+        target_link_libraries(${test_target} PRIVATE Scpi::scpi Qt6::Test)
         set_target_properties(${test_target} PROPERTIES AUTOMOC ON)
         add_test(NAME ${test_target} COMMAND ${test_target})
         set_tests_properties(${test_target} PROPERTIES TIMEOUT 30)
